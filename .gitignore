@@ -1,0 +1,10 @@
+node_modules/
+.DS_Store
+.env
+*.db
+*.db-journal
+.wwebjs_auth/
+.wwebjs_cache/
+dist/
+.venv/
+build/
