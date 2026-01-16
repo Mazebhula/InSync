@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -6,81 +7,139 @@ const db = require('./database');
 const crypto = require('crypto');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
+const passport = require('passport');
+const GoogleStrategy = require('passport-google-oauth20').Strategy;
+const session = require('express-session');
+const SQLiteStore = require('connect-sqlite3')(session);
 
 const app = express();
-app.use(cors());
+
+// --- Middleware ---
+app.use(cors({
+    origin: 'http://localhost:5173', // Must specify origin for credentials
+    credentials: true
+}));
 app.use(express.json());
+
+// Session Setup
+app.use(session({
+    store: new SQLiteStore({ db: 'sessions.db', dir: '.' }),
+    secret: process.env.SESSION_SECRET || 'dev_secret',
+    resave: false,
+    saveUninitialized: false,
+    cookie: { 
+        maxAge: 7 * 24 * 60 * 60 * 1000, // 1 week
+        httpOnly: true 
+        // secure: false // for localhost
+    } 
+}));
+
+// Passport Setup
+app.use(passport.initialize());
+app.use(passport.session());
+
+passport.serializeUser((user, done) => {
+    done(null, user.id);
+});
+
+passport.deserializeUser((id, done) => {
+    db.get("SELECT * FROM users WHERE id = ?", [id], (err, row) => {
+        done(err, row);
+    });
+});
+
+passport.use(new GoogleStrategy({
+    clientID: process.env.GOOGLE_CLIENT_ID,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    callbackURL: "/auth/google/callback"
+  },
+  function(accessToken, refreshToken, profile, cb) {
+      // Upsert user
+      db.run("INSERT OR REPLACE INTO users (id, displayName, photo) VALUES (?, ?, ?)", 
+        [profile.id, profile.displayName, profile.photos[0]?.value], 
+        (err) => {
+            if(err) return cb(err);
+            const user = { id: profile.id, displayName: profile.displayName, photo: profile.photos[0]?.value };
+            return cb(null, user);
+        }
+      );
+  }
+));
+
 
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: "*", 
-    methods: ["GET", "POST"]
+    origin: "http://localhost:5173", // Sync with Express CORS
+    methods: ["GET", "POST"],
+    credentials: true
   }
 });
 
-// --- WhatsApp Client Setup ---
 
-const whatsappClient = new Client({
+// --- Auth Routes ---
+app.get('/auth/google',
+  passport.authenticate('google', { scope: ['profile'] }));
 
-    authStrategy: new LocalAuth(),
+app.get('/auth/google/callback', 
+  passport.authenticate('google', { failureRedirect: 'http://localhost:5173/login?error=true' }),
+  function(req, res) {
+    // Successful authentication, redirect home.
+    res.redirect('http://localhost:5173/');
+  });
 
-    puppeteer: {
+app.post('/auth/logout', (req, res, next) => {
+    req.logout((err) => {
+        if (err) { return next(err); }
+        res.status(200).json({ message: 'Logged out' });
+    });
+});
 
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
-
-    },
-
-    webVersionCache: {
-
-        type: 'remote',
-
-        remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
-
+app.get('/api/me', (req, res) => {
+    if (req.isAuthenticated()) {
+        res.json(req.user);
+    } else {
+        res.status(401).json({ error: 'Not authenticated' });
     }
-
 });
 
 
+// --- WhatsApp Client Setup ---
+const whatsappClient = new Client({
+    authStrategy: new LocalAuth(),
+    puppeteer: {
+        args: ['--no-sandbox', '--disable-setuid-sandbox']
+    },
+    webVersionCache: {
+        type: 'remote',
+        remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
+    }
+});
 
 whatsappClient.on('qr', (qr) => {
-
     console.log('\n=============================================================');
-
     console.log('WHATSAPP WEB QR CODE RECEIVED');
-
     console.log('Scan this with your WhatsApp (Linked Devices) to login:');
-
     qrcode.generate(qr, { small: true });
-
     console.log('=============================================================\n');
-
 });
-
-
 
 whatsappClient.on('ready', () => {
-
     console.log('WhatsApp Client is ready!');
-
 });
-
-
 
 whatsappClient.on('message', async (msg) => {
     const text = msg.body.trim();
     
     // 1. CREATE TASK
-    // Accepts: "Task: Title", "Todo: Title", or just "Task Title"
     if (text.toLowerCase().startsWith('task') || text.toLowerCase().startsWith('todo')) {
-        let title = text.substring(4).trim(); // Remove "Task" or "Todo"
-        if (title.startsWith(':')) title = title.substring(1).trim(); // Remove colon if present
+        let title = text.substring(4).trim(); 
+        if (title.startsWith(':')) title = title.substring(1).trim(); 
         
         if (!title) return;
 
         console.log(`Received task from WhatsApp: ${title}`);
 
-        // Get count to determine order
         db.get('SELECT count(*) as count FROM tasks WHERE columnId = ?', ['todo'], async (err, row) => {
             if (err) {
                 console.error('Error fetching task count:', err);
@@ -89,19 +148,21 @@ whatsappClient.on('message', async (msg) => {
 
             const order = row ? row.count : 0;
             const id = crypto.randomUUID();
-            const color = 'bg-green-500'; // Default color for WA tasks
+            const color = 'bg-green-500';
 
             db.run(
-                "INSERT INTO tasks (id, title, columnId, \"order\", color) VALUES (?, ?, ?, ?, ?)",
-                [id, title, 'todo', order, color],
+                "INSERT INTO tasks (id, title, columnId, \"order\", color, creatorName) VALUES (?, ?, ?, ?, ?, ?)",
+                [id, title, 'todo', order, color, 'WhatsApp'], // Mark source as WhatsApp
                 async (err) => {
                     if (err) {
                         console.error('Error inserting task from WA:', err);
-                        try { await msg.reply('Error saving task.'); } catch (e) { console.error('Failed to reply', e); }
+                        try { await whatsappClient.sendMessage(msg.from, 'Error saving task.'); } 
+                        catch (e) { console.error('Note: Reply failed (WA compatibility), but task saved.'); }
                     } else {
-                        const newTask = { id, title, columnId: 'todo', order, color };
+                        const newTask = { id, title, columnId: 'todo', order, color, creatorName: 'WhatsApp' };
                         io.emit('task:created', newTask);
-                        try { await msg.reply(`✅ Task added to board: "${title}"`); } catch (e) { console.error('Failed to reply', e); }
+                        try { await whatsappClient.sendMessage(msg.from, `✅ Task added to board: "${title}"`); } 
+                        catch (e) { console.error('Note: Reply failed (WA compatibility), but task saved.'); }
                     }
                 }
             );
@@ -109,50 +170,47 @@ whatsappClient.on('message', async (msg) => {
     }
 
     // 2. DELETE TASK
-    // Format: "Delete: [Task Partial Name]"
     else if (text.toLowerCase().startsWith('delete') || text.toLowerCase().startsWith('remove')) {
         let taskNamePart = text.substring(6).trim(); 
         if (taskNamePart.startsWith(':')) taskNamePart = taskNamePart.substring(1).trim();
 
         if (!taskNamePart) return;
 
-        // Find task by partial name match
         db.get("SELECT * FROM tasks WHERE lower(title) LIKE ?", [`%${taskNamePart.toLowerCase()}%`], async (err, task) => {
             if (err) {
                 console.error(err);
                 return;
             }
             if (!task) {
-                try { await msg.reply(`❌ Task not found matching: "${taskNamePart}"`); } catch (e) {}
+                try { await whatsappClient.sendMessage(msg.from, `❌ Task not found matching: "${taskNamePart}"`); } 
+                catch (e) { console.error('Note: Reply failed (WA compatibility).'); }
                 return;
             }
 
-            // Delete the task
             db.run("DELETE FROM tasks WHERE id = ?", [task.id], async (deleteErr) => {
                 if (deleteErr) {
                     console.error(deleteErr);
-                    try { await msg.reply('❌ Error deleting task.'); } catch (e) {}
+                    try { await whatsappClient.sendMessage(msg.from, '❌ Error deleting task.'); } 
+                    catch (e) { console.error('Note: Reply failed (WA compatibility).'); }
                 } else {
                     io.emit('task:deleted', task.id);
-                    try { await msg.reply(`🗑️ Deleted task: "${task.title}"`); } catch (e) {}
+                    try { await whatsappClient.sendMessage(msg.from, `🗑️ Deleted task: "${task.title}"`); } 
+                    catch (e) { console.error('Note: Reply failed (WA compatibility).'); }
                 }
             });
         });
     }
 
     // 3. MOVE TASK
-    // Format: "Move: [Task Partial Name] to [Column Keyword]"
     else if (text.toLowerCase().startsWith('move')) {
-        // Expected format: "Move: <TaskName> to <Column>"
         const parts = text.split(' to ');
         if (parts.length < 2) return;
 
-        let taskNamePart = parts[0].substring(5).trim(); // Remove "Move:"
+        let taskNamePart = parts[0].substring(5).trim();
         if (taskNamePart.startsWith(':')) taskNamePart = taskNamePart.substring(1).trim();
         
         const targetColumnRaw = parts[1].trim().toLowerCase();
         
-        // Map target column
         let targetColumnId = 'todo';
         if (['done', 'completed', 'finish', 'finished'].some(k => targetColumnRaw.includes(k))) {
             targetColumnId = 'done';
@@ -161,38 +219,39 @@ whatsappClient.on('message', async (msg) => {
         } else if (['todo', 'backlog', 'start'].some(k => targetColumnRaw.includes(k))) {
             targetColumnId = 'todo';
         } else {
-             try { await msg.reply(`❌ Unknown column: "${targetColumnRaw}". Use "todo", "progress", or "done".`); } catch (e) {}
+             try { await whatsappClient.sendMessage(msg.from, `❌ Unknown column: "${targetColumnRaw}". Use "todo", "progress", or "done".`); } 
+             catch (e) { console.error('Note: Reply failed (WA compatibility).'); }
              return;
         }
 
-        // Find task by partial name match
         db.get("SELECT * FROM tasks WHERE lower(title) LIKE ?", [`%${taskNamePart.toLowerCase()}%`], async (err, task) => {
             if (err) {
                 console.error(err);
                 return;
             }
             if (!task) {
-                try { await msg.reply(`❌ Task not found matching: "${taskNamePart}"`); } catch (e) {}
+                try { await whatsappClient.sendMessage(msg.from, `❌ Task not found matching: "${taskNamePart}"`); } 
+                catch (e) { console.error('Note: Reply failed (WA compatibility).'); }
                 return;
             }
 
-            // Move the task
             const newOrder = 0; 
             
             db.run("UPDATE tasks SET columnId = ?, \"order\" = ? WHERE id = ?", [targetColumnId, newOrder, task.id], async (updateErr) => {
                 if (updateErr) {
                     console.error(updateErr);
-                    try { await msg.reply('❌ Error moving task.'); } catch (e) {}
+                    try { await whatsappClient.sendMessage(msg.from, '❌ Error moving task.'); } 
+                    catch (e) { console.error('Note: Reply failed (WA compatibility).'); }
                 } else {
                     io.emit('task:moved', { id: task.id, columnId: targetColumnId, order: newOrder });
-                    try { await msg.reply(`✅ Moved "${task.title}" to ${targetColumnId.toUpperCase()}`); } catch (e) {}
+                    try { await whatsappClient.sendMessage(msg.from, `✅ Moved "${task.title}" to ${targetColumnId.toUpperCase()}`); } 
+                    catch (e) { console.error('Note: Reply failed (WA compatibility).'); }
                 }
             });
         });
     }
 });
 
-// Start WhatsApp Client
 whatsappClient.initialize();
 
 
@@ -212,24 +271,40 @@ app.get('/api/messages', (req, res) => {
 });
 
 // --- Socket.io Logic ---
+// We can use a middleware to inject user info into socket if we shared session store,
+// but for simplicity we'll just pass user info in the payload from client.
+// OR we can make the socket protected. For this demo, we trust the client to send 'user' object.
+
 io.on('connection', (socket) => {
   console.log('A user connected:', socket.id);
 
   socket.on('task:create', (data) => {
+    // data should now include user info if logged in
     const id = crypto.randomUUID();
-    const { title, columnId, order, color } = data;
+    const { title, columnId, order, color, user } = data;
+    
+    // Safe fallback if user is null
+    const creatorId = user ? user.id : null;
+    const creatorName = user ? user.displayName : 'Anonymous';
+    const creatorPhoto = user ? user.photo : null;
+
     db.run(
-      "INSERT INTO tasks (id, title, columnId, \"order\", color) VALUES (?, ?, ?, ?, ?)",
-      [id, title, columnId, order, color],
+      "INSERT INTO tasks (id, title, columnId, \"order\", color, creatorId, creatorName, creatorPhoto) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      [id, title, columnId, order, color, creatorId, creatorName, creatorPhoto],
       (err) => {
         if (err) return console.error(err);
-        const newTask = { id, title, columnId, order, color };
+        const newTask = { id, title, columnId, order, color, creatorId, creatorName, creatorPhoto };
         io.emit('task:created', newTask);
       }
     );
   });
 
   socket.on('task:move', (data) => {
+    // We can also track WHO moved it if we want, but schema doesn't have 'lastModifiedBy' yet.
+    // We do have 'assignee'.
+    // If we want to assign on move?
+    // For now, let's just move.
+    
     const { id, columnId, order } = data;
     db.run("UPDATE tasks SET columnId = ?, \"order\" = ? WHERE id = ?", [columnId, order, id], (err) => {
         if (err) return console.error(err);
@@ -246,12 +321,18 @@ io.on('connection', (socket) => {
 
   socket.on('message:send', (data) => {
     const id = crypto.randomUUID();
-    const { text, sender } = data;
+    const { text, sender, user } = data; // user is passed from client
+    
+    const senderName = user ? user.displayName : sender;
+    const senderPhoto = user ? user.photo : null;
+    const senderId = user ? user.id : null;
+
     const timestamp = Date.now();
     
-    db.run("INSERT INTO messages (id, text, sender, timestamp) VALUES (?, ?, ?, ?)", [id, text, sender, timestamp], (err) => {
+    db.run("INSERT INTO messages (id, text, sender, timestamp, senderId, senderPhoto) VALUES (?, ?, ?, ?, ?, ?)", 
+        [id, text, senderName, timestamp, senderId, senderPhoto], (err) => {
         if (err) return console.error(err);
-        io.emit('message:received', { id, text, sender, timestamp });
+        io.emit('message:received', { id, text, sender: senderName, timestamp, senderId, senderPhoto });
     });
   });
 
@@ -261,6 +342,7 @@ io.on('connection', (socket) => {
 });
 
 const PORT = 3001;
+console.log('Attempting to start server on port', PORT);
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });

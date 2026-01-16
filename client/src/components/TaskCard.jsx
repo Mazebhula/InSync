@@ -51,9 +51,17 @@ export function TaskCard({ task, onDelete }) {
          </button>
       </div>
       
-      {task.color && (
-         <div className={`mt-3 h-1 w-8 rounded-full ${task.color}`} />
-      )}
+      <div className="mt-3 flex items-center justify-between">
+         {task.color ? (
+             <div className={`h-1 w-8 rounded-full ${task.color}`} />
+         ) : <div />}
+
+         {task.creatorPhoto ? (
+             <img src={task.creatorPhoto} title={`Created by ${task.creatorName}`} className="h-5 w-5 rounded-full border border-background" />
+         ) : task.creatorName === 'WhatsApp' ? (
+             <div className="h-5 w-5 rounded-full bg-green-500 flex items-center justify-center text-[8px] font-bold text-white" title="Created via WhatsApp">WA</div>
+         ) : null}
+      </div>
     </div>
   );
 }

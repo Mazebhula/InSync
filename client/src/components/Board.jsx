@@ -29,7 +29,7 @@ const dropAnimation = {
     }),
 };
 
-export function Board({ socket }) {
+export function Board({ socket, user }) {
     const [tasks, setTasks] = useState([]);
     const [activeId, setActiveId] = useState(null);
 
@@ -177,7 +177,8 @@ export function Board({ socket }) {
             title,
             columnId,
             order: maxOrder + 1,
-            color
+            color,
+            user // Pass the logged-in user
         });
     };
 
