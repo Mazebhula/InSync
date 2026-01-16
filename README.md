@@ -1,0 +1,1 @@
+Ticket system with persistent chat and tasks
