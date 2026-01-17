@@ -1,64 +1,21 @@
 import React, { useEffect, useState } from 'react';
+import { Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { Board } from './components/Board';
 import { Chat } from './components/Chat';
 import { Login } from './components/Login';
+import { AdminLogin } from './components/AdminLogin';
+import { AdminDashboard } from './components/AdminDashboard';
 import { io } from 'socket.io-client';
 import axios from 'axios';
 import { LogOut } from 'lucide-react';
 
-// Initialize socket connection outside component to prevent reconnects on re-render
 export const socket = io('http://localhost:3001', {
   withCredentials: true 
 });
 
-function App() {
-  const [isConnected, setIsConnected] = useState(socket.connected);
-  const [user, setUser] = useState(null);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    // Check auth status
-    axios.get('http://localhost:3001/api/me', { withCredentials: true })
-      .then(res => {
-        setUser(res.data);
-        setLoading(false);
-      })
-      .catch(() => {
-        setUser(null);
-        setLoading(false);
-      });
-
-    function onConnect() {
-      setIsConnected(true);
-    }
-
-    function onDisconnect() {
-      setIsConnected(false);
-    }
-
-    socket.on('connect', onConnect);
-    socket.on('disconnect', onDisconnect);
-
-    return () => {
-      socket.off('connect', onConnect);
-      socket.off('disconnect', onDisconnect);
-    };
-  }, []);
-
-  const handleLogout = () => {
-      axios.post('http://localhost:3001/auth/logout', {}, { withCredentials: true })
-        .then(() => {
-            setUser(null);
-            window.location.reload();
-        });
-  };
-
-  if (loading) {
-    return <div className="h-screen w-full flex items-center justify-center bg-background text-muted-foreground">Loading...</div>;
-  }
-
+function MainApp({ user, isConnected, handleLogout }) {
   if (!user) {
-    return <Login />;
+      return <Navigate to="/login" />;
   }
 
   return (
@@ -96,6 +53,67 @@ function App() {
         <Chat socket={socket} user={user} />
       </div>
     </div>
+  );
+}
+
+function App() {
+  const [isConnected, setIsConnected] = useState(socket.connected);
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const location = useLocation();
+
+  useEffect(() => {
+    // Only check auth for non-admin routes to avoid unnecessary calls/redirects if we are just logging into admin
+    // But actually, we want to know if we are logged in generally.
+    
+    axios.get('http://localhost:3001/api/me', { withCredentials: true })
+      .then(res => {
+        setUser(res.data);
+        setLoading(false);
+      })
+      .catch(() => {
+        setUser(null);
+        setLoading(false);
+      });
+
+    function onConnect() {
+      setIsConnected(true);
+    }
+
+    function onDisconnect() {
+      setIsConnected(false);
+    }
+
+    socket.on('connect', onConnect);
+    socket.on('disconnect', onDisconnect);
+
+    return () => {
+      socket.off('connect', onConnect);
+      socket.off('disconnect', onDisconnect);
+    };
+  }, []);
+
+  const handleLogout = () => {
+      axios.post('http://localhost:3001/auth/logout', {}, { withCredentials: true })
+        .then(() => {
+            setUser(null);
+            // We don't reload, just state update will trigger redirect to login
+        });
+  };
+
+  if (loading) {
+    return <div className="h-screen w-full flex items-center justify-center bg-background text-muted-foreground">Loading...</div>;
+  }
+
+  return (
+    <Routes>
+        <Route path="/login" element={user ? <Navigate to="/" /> : <Login />} />
+        
+        <Route path="/admin" element={<AdminLogin />} />
+        <Route path="/admin/dashboard" element={<AdminDashboard socket={socket} />} />
+
+        <Route path="/" element={<MainApp user={user} isConnected={isConnected} handleLogout={handleLogout} />} />
+    </Routes>
   );
 }
 

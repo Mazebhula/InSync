@@ -16,7 +16,7 @@ const app = express();
 
 // --- Middleware ---
 app.use(cors({
-    origin: 'http://localhost:5173', // Must specify origin for credentials
+    origin: 'http://localhost:5173', 
     credentials: true
 }));
 app.use(express.json());
@@ -30,7 +30,6 @@ app.use(session({
     cookie: { 
         maxAge: 7 * 24 * 60 * 60 * 1000, // 1 week
         httpOnly: true 
-        // secure: false // for localhost
     } 
 }));
 
@@ -54,7 +53,6 @@ passport.use(new GoogleStrategy({
     callbackURL: "/auth/google/callback"
   },
   function(accessToken, refreshToken, profile, cb) {
-      // Upsert user
       db.run("INSERT OR REPLACE INTO users (id, displayName, photo) VALUES (?, ?, ?)", 
         [profile.id, profile.displayName, profile.photos[0]?.value], 
         (err) => {
@@ -70,7 +68,7 @@ passport.use(new GoogleStrategy({
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: "http://localhost:5173", // Sync with Express CORS
+    origin: "http://localhost:5173", 
     methods: ["GET", "POST"],
     credentials: true
   }
@@ -84,7 +82,6 @@ app.get('/auth/google',
 app.get('/auth/google/callback', 
   passport.authenticate('google', { failureRedirect: 'http://localhost:5173/login?error=true' }),
   function(req, res) {
-    // Successful authentication, redirect home.
     res.redirect('http://localhost:5173/');
   });
 
@@ -103,6 +100,9 @@ app.get('/api/me', (req, res) => {
     }
 });
 
+// --- Admin QR Code Streaming ---
+// We use a simple in-memory variable to store the latest QR for new connections
+let latestQR = null;
 
 // --- WhatsApp Client Setup ---
 const whatsappClient = new Client({
@@ -117,15 +117,18 @@ const whatsappClient = new Client({
 });
 
 whatsappClient.on('qr', (qr) => {
-    console.log('\n=============================================================');
-    console.log('WHATSAPP WEB QR CODE RECEIVED');
-    console.log('Scan this with your WhatsApp (Linked Devices) to login:');
+    console.log('\nWHATSAPP WEB QR CODE RECEIVED\n');
     qrcode.generate(qr, { small: true });
-    console.log('=============================================================\n');
+    
+    // Store and broadcast to admin dashboard
+    latestQR = qr;
+    io.emit('admin:qr', qr);
 });
 
 whatsappClient.on('ready', () => {
     console.log('WhatsApp Client is ready!');
+    latestQR = null; // Clear QR when ready
+    io.emit('admin:ready', true);
 });
 
 whatsappClient.on('message', async (msg) => {
@@ -152,7 +155,7 @@ whatsappClient.on('message', async (msg) => {
 
             db.run(
                 "INSERT INTO tasks (id, title, columnId, \"order\", color, creatorName) VALUES (?, ?, ?, ?, ?, ?)",
-                [id, title, 'todo', order, color, 'WhatsApp'], // Mark source as WhatsApp
+                [id, title, 'todo', order, color, 'WhatsApp'], 
                 async (err) => {
                     if (err) {
                         console.error('Error inserting task from WA:', err);
@@ -255,35 +258,20 @@ whatsappClient.on('message', async (msg) => {
 whatsappClient.initialize();
 
 
-// --- REST API ---
-app.get('/api/tasks', (req, res) => {
-  db.all("SELECT * FROM tasks ORDER BY \"order\" ASC", [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
-});
-
-app.get('/api/messages', (req, res) => {
-  db.all("SELECT * FROM messages ORDER BY timestamp ASC", [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
-});
-
 // --- Socket.io Logic ---
-// We can use a middleware to inject user info into socket if we shared session store,
-// but for simplicity we'll just pass user info in the payload from client.
-// OR we can make the socket protected. For this demo, we trust the client to send 'user' object.
 
 io.on('connection', (socket) => {
   console.log('A user connected:', socket.id);
 
+  // Send latest QR if available on connect (for admin dashboard)
+  if (latestQR) {
+      socket.emit('admin:qr', latestQR);
+  }
+
   socket.on('task:create', (data) => {
-    // data should now include user info if logged in
     const id = crypto.randomUUID();
     const { title, columnId, order, color, user } = data;
     
-    // Safe fallback if user is null
     const creatorId = user ? user.id : null;
     const creatorName = user ? user.displayName : 'Anonymous';
     const creatorPhoto = user ? user.photo : null;
@@ -300,11 +288,6 @@ io.on('connection', (socket) => {
   });
 
   socket.on('task:move', (data) => {
-    // We can also track WHO moved it if we want, but schema doesn't have 'lastModifiedBy' yet.
-    // We do have 'assignee'.
-    // If we want to assign on move?
-    // For now, let's just move.
-    
     const { id, columnId, order } = data;
     db.run("UPDATE tasks SET columnId = ?, \"order\" = ? WHERE id = ?", [columnId, order, id], (err) => {
         if (err) return console.error(err);
@@ -321,7 +304,7 @@ io.on('connection', (socket) => {
 
   socket.on('message:send', (data) => {
     const id = crypto.randomUUID();
-    const { text, sender, user } = data; // user is passed from client
+    const { text, sender, user } = data; 
     
     const senderName = user ? user.displayName : sender;
     const senderPhoto = user ? user.photo : null;

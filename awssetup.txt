@@ -1,0 +1,165 @@
+# Hosting Guide: SyncTeam (Node.js + React + Socket.io + SQLite + WhatsApp)
+
+## Recommendation: AWS vs. Vercel/Netlify
+
+For this specific project (**SyncTeam**), **AWS (EC2)** or a VPS (like DigitalOcean/Render) is **BETTER** than Vercel/Netlify.
+
+### Why NOT Vercel/Netlify?
+1.  **WebSockets:** Vercel functions are serverless and stateless. They **do not support persistent Socket.io connections**. You would need a separate service (like Pusher) or a dedicated server just for the socket part.
+2.  **WhatsApp Client:** `whatsapp-web.js` runs a Headless Chrome instance (Puppeteer). This is very heavy and **cannot run** in a standard serverless function (Vercel/AWS Lambda) due to timeout and size limits. It needs a continuously running process.
+3.  **SQLite:** SQLite is a local file. On serverless (Vercel), the file system is ephemeral (deleted after execution). You would lose your database instantly.
+
+### Why AWS (EC2) or VPS?
+*   **Persistent Process:** You can run `node index.js` forever using `pm2`.
+*   **Storage:** You can keep the `kanban.db` and WhatsApp session files (`.wwebjs_auth`) on the disk.
+*   **Full Control:** You have full access to install Chrome/Puppeteer dependencies.
+
+---
+
+## Step-by-Step AWS EC2 Hosting Guide
+
+This guide assumes you have an AWS account. We will use a **t3.small** or **t3.medium** (Puppeteer needs RAM, `t2.micro` free tier might crash with Chrome).
+
+### 1. Launch an EC2 Instance
+1.  Go to **EC2 Dashboard** -> **Launch Instance**.
+2.  **Name:** `SyncTeam-Server`.
+3.  **OS:** Ubuntu 24.04 LTS (or 22.04).
+4.  **Instance Type:** `t3.small` (recommended minimum for Puppeteer) or `t2.micro` (free tier, but might struggle/swap).
+5.  **Key Pair:** Create new (e.g., `syncteam-key`) and download the `.pem` file.
+6.  **Network Settings (Security Group):**
+    *   Allow SSH (Port 22) from your IP.
+    *   Allow HTTP (Port 80) and HTTPS (Port 443) from Anywhere (`0.0.0.0/0`).
+    *   Allow Custom TCP (Port 3001) from Anywhere (for testing, later restrict/proxy).
+7.  **Storage:** 20GB gp3 (default is fine).
+8.  **Launch Instance**.
+
+### 2. Connect via SSH
+Open your terminal:
+```bash
+chmod 400 syncteam-key.pem
+ssh -i syncteam-key.pem ubuntu@<YOUR_EC2_PUBLIC_IP>
+```
+
+### 3. Install Dependencies
+Update and install Node.js, Nginx, and Chrome dependencies (for Puppeteer).
+
+```bash
+# Update system
+sudo apt update && sudo apt upgrade -y
+
+# Install Node.js 18+
+curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+sudo apt install -y nodejs build-essential
+
+# Install Puppeteer/Chrome dependencies (Updated for Ubuntu 24.04)
+sudo apt install -y ca-certificates fonts-liberation libappindicator3-1 libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libc6 libcairo2 libcups2t64 libdbus-1-3 libexpat1 libfontconfig1 libgbm1 libgcc-s1 libglib2.0-0t64 libgtk-3-0t64 libnspr4 libnss3 libpango-1.0-0 libpangocairo-1.0-0 libstdc++6 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxcursor1 libxdamage1 libxext6 libxfixes3 libxi6 libxrandr2 libxrender1 libxss1 libxtst6 lsb-release wget xdg-utils
+
+# Install Nginx (Reverse Proxy)
+sudo apt install -y nginx
+
+# Install PM2 (Process Manager)
+sudo npm install -g pm2
+```
+
+### 4. Clone and Setup Project
+```bash
+# Clone your repo (you need to push it to GitHub first!)
+git clone https://github.com/<YOUR_USERNAME>/<YOUR_REPO>.git
+cd <YOUR_REPO>
+
+# Install Dependencies
+npm run install-all
+
+# Build Frontend
+cd client
+npm run build
+cd ..
+```
+
+### 5. Configure Backend (Environment)
+Create your `.env` file on the server.
+```bash
+nano server/.env
+```
+Paste your content:
+```env
+GOOGLE_CLIENT_ID=...
+GOOGLE_CLIENT_SECRET=...
+SESSION_SECRET=...
+# IMPORTANT: Update callback URL in Google Console to match your domain/IP!
+# e.g., http://<EC2_IP>/auth/google/callback
+```
+
+### 6. Start the Application with PM2
+We will serve the frontend **via the Express backend** or Nginx.
+*Option A (Easiest):* Serve static frontend files from Express.
+*Option B (Professional):* Nginx serves frontend, proxies backend.
+
+Let's do **Option A** logic for simplicity (modify `server/index.js` to serve `client/dist`).
+
+**Modify `server/index.js` (Run this on your local machine and push, or edit on server):**
+Add this before `server.listen`:
+```javascript
+const path = require('path');
+// Serve static files
+app.use(express.static(path.join(__dirname, '../client/dist')));
+// Handle React routing, return all requests to React app
+app.get('*', (req, res) => {
+  if (req.path.startsWith('/api') || req.path.startsWith('/auth') || req.path.startsWith('/socket.io')) return;
+  res.sendFile(path.join(__dirname, '../client/dist/index.html'));
+});
+```
+
+**Start with PM2:**
+```bash
+cd server
+pm2 start index.js --name "syncteam"
+pm2 save
+pm2 startup
+```
+
+### 7. Configure Nginx (Reverse Proxy)
+This allows you to access the app via Port 80 (standard HTTP) instead of 3001.
+
+```bash
+sudo nano /etc/nginx/sites-available/default
+```
+
+Replace content with:
+```nginx
+server {
+    listen 80;
+    server_name _; # Or your domain name
+
+    location / {
+        proxy_pass http://localhost:3001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+    }
+}
+```
+
+**Restart Nginx:**
+```bash
+sudo systemctl restart nginx
+```
+
+### 8. Final Steps
+1.  **WhatsApp QR:** View the logs to scan the QR code.
+    ```bash
+    pm2 logs syncteam
+    ```
+2.  **Google Console:** Go to Google Cloud Console and add `http://<YOUR_EC2_IP>/auth/google/callback` to Authorized Redirect URIs.
+
+Your app is now live at `http://<YOUR_EC2_IP>`!
+
+---
+**Alternative: Render.com (Easier than AWS)**
+If you want something easier but still "Server-ful":
+1.  Deploy to **Render** as a "Web Service".
+2.  Use "Docker" environment (create a `Dockerfile`).
+3.  Add a "Disk" to persist SQLite and WhatsApp session.
+4.  Render handles SSL (HTTPS) automatically.
